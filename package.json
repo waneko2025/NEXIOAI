@@ -1,0 +1,19 @@
+{
+  "name": "nexio-ai",
+  "version": "7.7.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "postinstall": "npm run build",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "vite": "^7.1.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

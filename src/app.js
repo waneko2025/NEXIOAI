@@ -1,0 +1,1108 @@
+
+/* NEXIO AI theme preference: system on first visit, then persist the user's choice. */
+(function initAlifoTheme() {
+  const KEY = "alifo-theme";
+  const root = document.documentElement;
+
+  function getStoredTheme() {
+    const value = localStorage.getItem(KEY);
+    return value === "light" || value === "dark" || value === "system" ? value : null;
+  }
+
+  function systemTheme() {
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark" : "light";
+  }
+
+  function applyTheme(choice, persist = true) {
+    const actual = choice === "system" ? systemTheme() : choice;
+    root.dataset.theme = actual;
+    root.style.colorScheme = actual;
+    if (persist) localStorage.setItem(KEY, choice);
+    document.querySelectorAll("[data-theme-choice]").forEach((el) => {
+      el.setAttribute("aria-pressed", el.dataset.themeChoice === choice ? "true" : "false");
+    });
+  }
+
+  window.alifoSetTheme = function(theme) {
+    if (theme === "system" || theme === "light" || theme === "dark") {
+      applyTheme(theme, true);
+    }
+  };
+
+  const initial = getStoredTheme() || "system";
+  applyTheme(initial, false);
+
+  const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  if (media) {
+    const onSystemThemeChange = () => {
+      if ((getStoredTheme() || "system") === "system") applyTheme("system", false);
+    };
+    if (media.addEventListener) media.addEventListener("change", onSystemThemeChange);
+    else if (media.addListener) media.addListener(onSystemThemeChange);
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    const host = document.querySelector("[data-theme-controls]");
+    if (!host) return;
+    host.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-theme-choice]");
+      if (!button) return;
+      applyTheme(button.dataset.themeChoice, true);
+    });
+  });
+})();
+
+// NEXIO AI v4.3 stable state initialization
+const $ = (sel) => document.querySelector(sel);
+
+// Normalize AI/user text safely on the client. Keep this local because the
+// relevance guard runs before any answer is rendered.
+function textOf(value) {
+  if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
+  if (value == null) return "";
+  if (Array.isArray(value)) return value.map(textOf).filter(Boolean).join(" ");
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return textOf(value.text);
+    if (typeof value.content === "string") return textOf(value.content);
+  }
+  return String(value).replace(/\s+/g, " ").trim();
+}
+const messages = $("#messages");
+const empty = $("#empty");
+const prompt = $("#prompt");
+const send = $("#send");
+const generateImageBtn = $("#generateImage");
+const attachImageBtn = $("#attachImage");
+const imageInput = $("#imageInput");
+let language = localStorage.getItem("alifo_lang") === "en" ? "en" : "ja";
+let chats = [];
+let currentId = null;
+let pendingAttachment = null;
+try {
+  const raw = localStorage.getItem("alifo_chats");
+  const parsed = raw ? JSON.parse(raw) : [];
+  if (Array.isArray(parsed)) chats = parsed.filter(c => c && typeof c === "object" && Array.isArray(c.messages));
+} catch { chats = []; }
+
+// AI priority: Puter AI (GPT/Gemini/Claude models) -> WebGPU local model -> CPU/WASM local model -> built-in fallback.
+// No provider-specific API key is stored in NEXIO AI. Puter handles the external AI connection.
+let aiWorker = null;
+let aiWorkerPromise = null;
+let aiRequestId = 0;
+const LOCAL_MODEL = {
+  id: "onnx-community/Qwen2.5-0.5B-Instruct",
+  label: "Qwen2.5 0.5B",
+  approx: "約786MB（q4）"
+};
+
+function createAIWorker() {
+  if (!aiWorker) aiWorker = new Worker(new URL("./ai-worker.js", import.meta.url), { type: "module" });
+  return aiWorker;
+}
+
+function getLocalEngine(forceWasm = false) {
+  if (!forceWasm && aiWorkerPromise) return aiWorkerPromise;
+  if (forceWasm) {
+    aiWorker?.terminate?.();
+    aiWorker = null;
+    aiWorkerPromise = null;
+  }
+
+  aiWorkerPromise = new Promise((resolve, reject) => {
+    const worker = createAIWorker();
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stopCountdown();
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onWorkerError);
+      fn(value);
+    };
+    const onWorkerError = (event) => {
+      finish(reject, new Error(event?.message || "Local AI worker failed"));
+    };
+    const onMessage = (event) => {
+      const d = event.data || {};
+      if (d.type === "progress") {
+        const el = document.querySelector("#localAiStatus");
+        if (el && Number.isFinite(d.progress)) {
+          el.textContent = language === "ja"
+            ? `端末内AI（${d.runtime === "webgpu" ? "WebGPU" : "CPU/WASM"}）を準備中… ${Math.round(d.progress)}%`
+            : `Preparing on-device AI (${d.runtime === "webgpu" ? "WebGPU" : "CPU/WASM"})… ${Math.round(d.progress)}%`;
+        }
+        return;
+      }
+      if (d.type === "ready") {
+        finish(resolve, {
+          runtime: d.runtime,
+          generate: (payload, onChunk) => generateInWorker(worker, payload, onChunk)
+        });
+      } else if (d.type === "error" && d.scope === "init") {
+        finish(reject, Object.assign(
+          new Error(d.message || "Local AI initialization failed"),
+          { runtime: d.runtime || "unknown" }
+        ));
+      }
+    };
+    // A browser-side model can take a while to download. If it has not
+    // initialized after this period, continue to the built-in fallback.
+    const timeoutMs = 30000;
+    const stopCountdown = startTimeoutCountdown(timeoutMs, "ローカルAI準備");
+    const timer = setTimeout(() => {
+      worker.terminate();
+      aiWorker = null;
+      aiWorkerPromise = null;
+      finish(reject, new Error("Local AI initialization timed out"));
+    }, timeoutMs);
+
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onWorkerError);
+    worker.postMessage({ type: "init", model: LOCAL_MODEL.id, language, forceWasm });
+  }).catch(err => {
+    aiWorkerPromise = null;
+    throw err;
+  });
+  return aiWorkerPromise;
+}
+
+function generateInWorker(worker, payload, onChunk) {
+  return new Promise((resolve, reject) => {
+    const id = ++aiRequestId;
+    const handler = (event) => {
+      const d = event.data || {};
+      if (d.id !== id) return;
+      if (d.type === "chunk") onChunk?.(d.text || "");
+      else if (d.type === "done") { worker.removeEventListener("message", handler); resolve(d.text || ""); }
+      else if (d.type === "error") { worker.removeEventListener("message", handler); reject(Object.assign(new Error(d.message || "Local AI generation failed"), { runtime: d.runtime || "unknown" })); }
+    };
+    worker.addEventListener("message", handler);
+    worker.postMessage({ type: "generate", id, ...payload });
+  });
+}
+
+function setAiStatus(state, runtime = "external") {
+  const badge = document.querySelector("#externalAiBadge");
+  const text = document.querySelector("#externalAiBadgeText");
+  const footer = document.querySelector("#localAiStatus");
+  if (!badge) return;
+  badge.classList.remove("connected", "connecting", "error", "puter", "webgpu", "cpu", "fallback");
+  const cls = runtime === "puter" ? "puter" : runtime === "webgpu" ? "webgpu" : runtime === "cpu" ? "cpu" : runtime === "fallback" ? "fallback" : state;
+  badge.classList.add(cls);
+  if (text) text.textContent = "";
+  if (footer) footer.textContent = "";
+}
+
+function checkExternalAi() {
+  return !!window.puter?.ai?.chat;
+}
+
+function extractPuterText(result) {
+  const content = result?.message?.content ?? result?.content ?? result?.text ?? result;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (typeof part === "string") return part;
+      return part?.text || part?.content || "";
+    }).join("\n").trim();
+  }
+  return "";
+}
+
+let puterModelCache = { models: [], providers: [], fetchedAt: 0 };
+const PUTER_MODEL_CACHE_MS = 5 * 60 * 1000;
+
+function normalizePuterModels(models) {
+  return (Array.isArray(models) ? models : [])
+    .filter(m => m && m.id)
+    .map(m => ({
+      id: String(m.id),
+      provider: String(m.provider || "unknown"),
+      name: String(m.name || m.id),
+      aliases: Array.isArray(m.aliases) ? m.aliases.map(String) : [],
+      context: Number(m.context) || 0,
+      max_tokens: Number(m.max_tokens) || 0,
+      cost: m.cost || null
+    }));
+}
+
+async function getPuterModelCatalog(force = false) {
+  if (!window.puter?.ai?.listModels) return { models: [], providers: [] };
+  const fresh = Date.now() - puterModelCache.fetchedAt < PUTER_MODEL_CACHE_MS;
+  if (!force && fresh && puterModelCache.models.length) return puterModelCache;
+  try {
+    const [models, providers] = await Promise.all([
+      withTimeout(window.puter.ai.listModels(), 20000, "Puter model list timed out", "Puterモデル一覧"),
+      window.puter.ai.listModelProviders
+        ? withTimeout(window.puter.ai.listModelProviders(), 5000, "Puter provider list timed out", "Puter提供元一覧").catch(() => [])
+        : Promise.resolve([])
+    ]);
+    puterModelCache = {
+      models: normalizePuterModels(models),
+      providers: Array.isArray(providers) ? providers.map(String) : [],
+      fetchedAt: Date.now()
+    };
+    updatePuterModelInfo();
+    return puterModelCache;
+  } catch (err) {
+    console.warn("Puter model discovery failed", err);
+    return puterModelCache;
+  }
+}
+
+async function getPuterModels(force = false) {
+  const catalog = await getPuterModelCatalog(force);
+  return catalog.models;
+}
+
+function providerFamily(kind, model) {
+  const hay = `${model?.provider || ""} ${model?.id || ""} ${model?.name || ""}`.toLowerCase();
+  if (kind === "gpt") return /openai|gpt/.test(hay);
+  if (kind === "gemini") return /google|gemini/.test(hay);
+  return /anthropic|claude/.test(hay);
+}
+
+function pickPuterModel(models, kind) {
+  const list = Array.isArray(models) ? models : [];
+  const candidates = list.filter(m => providerFamily(kind, m));
+  if (!candidates.length) return null;
+
+  // Prefer explicitly named current models when they are present, but never
+  // invent a model ID. Every returned ID comes from Puter's live catalog.
+  const preferred = kind === "gpt"
+    ? ["gpt-5.6-luna", "gpt-5.6", "gpt-5.5", "gpt-5-nano"]
+    : kind === "gemini"
+      ? ["gemini-3.1-flash-lite", "gemini-3.1-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
+      : ["claude-sonnet-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-sonnet-4"];
+  for (const wanted of preferred) {
+    const exact = candidates.find(m => m.id.toLowerCase() === wanted.toLowerCase() || m.aliases.some(a => a.toLowerCase() === wanted.toLowerCase()));
+    if (exact) return exact.id;
+  }
+
+  // Prefer free variants when Puter exposes one, then a model with a useful
+  // context window. This keeps discovery automatic without guessing IDs.
+  const sorted = [...candidates].sort((a, b) => {
+    const af = /:free$/i.test(a.id) ? 0 : 1;
+    const bf = /:free$/i.test(b.id) ? 0 : 1;
+    if (af !== bf) return af - bf;
+    return (b.context || 0) - (a.context || 0);
+  });
+  return sorted[0]?.id || null;
+}
+
+function updatePuterModelInfo() {
+  const box = document.querySelector("#puterModelInfo");
+  if (!box) return;
+  const count = puterModelCache.models.length;
+  const providers = puterModelCache.providers.length
+    ? puterModelCache.providers.join(", ")
+    : [...new Set(puterModelCache.models.map(m => m.provider))].join(", ");
+  box.textContent = language === "ja"
+    ? `Puterで利用可能なチャットモデル: ${count}個${providers ? `（提供元: ${providers}）` : ""}`
+    : `Puter chat models available: ${count}${providers ? ` (providers: ${providers})` : ""}`;
+}
+
+function isFactualQuestion(q = "") {
+  return isQuestionLike(q) || containsAny(q, ["最新", "今日", "現在", "いつ", "誰", "どこ", "ニュース", "発売", "放送", "価格", "値段", "公式"]);
+}
+
+function isQuestionLike(q = "") {
+  return /[?？]$/.test(q) || containsAny(q, ["なぜ", "どうして", "どうやって", "とは", "って何", "教えて", "説明して", "分かる", "わかる", "誰", "どこ", "いつ"]);
+}
+
+function qualitySystemPrompt() {
+  return language === "ja"
+    ? "あなたはNEXIO AIです。ユーザーの現在の依頼を最優先してください。前の会話は明確に参照された場合だけ使います。事実を推測で埋めず、確認できない情報は分からないと伝えてください。最新情報は利用できるWeb検索がある場合のみ検索し、検索していないのに検索したとは言わないでください。質問には最初に結論や要点を答えてください。回答は読みやすく整理し、必要な場合だけ見出しや箇条書きを使ってください。通常は短め（目安700文字以内）にし、複雑な質問だけ必要な範囲で詳しくしてください。同じ内容を繰り返さないでください。日本語で自然に、分かりやすく、安全に答えてください。"
+    : "You are NEXIO AI. Prioritize the user's current request. Use previous conversation only when clearly referenced. Never fill factual gaps by guessing; say when information cannot be verified. For current information, use web search when available and never claim to have searched when you did not. Give the conclusion or key point first. Keep answers easy to scan with short paragraphs, headings, or bullets only when useful. Usually stay concise (about 700 characters or less), and expand only when the question genuinely needs more detail. Do not repeat the same point. Answer naturally, clearly, and safely in English.";
+}
+
+async function waitForPuter(maxMs = 6000) {
+  const started = Date.now();
+  while (Date.now() - started < maxMs) {
+    if (window.puter?.ai?.chat) return true;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return !!window.puter?.ai?.chat;
+}
+
+async function getAlifoMediaContext(query) {
+  const q = textOf(query).toLowerCase();
+  if (!/alifo\s*media|alifomedia|alifo-media|alifoメディア|alifoニュース|alifomediaニュース/.test(q)) return "";
+  try {
+    const response = await withTimeout(
+      fetch("/api/alifomedia-news", { headers: { "Accept": "application/json" } }),
+      9000,
+      "ALIFOmedia news fetch timed out",
+      "ALIFOmedia news"
+    );
+    if (!response.ok) return "";
+    const data = await response.json();
+    const items = Array.isArray(data?.items) ? data.items.slice(0, 8) : [];
+    if (!items.length) return "";
+    return [
+      "ALIFOmediaの最新ニュース情報（NEXIO AIが直接取得した公開情報）:",
+      ...items.map((item, i) => [
+        `${i + 1}. ${textOf(item.title)}`,
+        item.date ? `日付: ${textOf(item.date)}` : "",
+        item.description ? `概要: ${textOf(item.description)}` : "",
+        item.link ? `URL: ${item.link}` : ""
+      ].filter(Boolean).join(" | ")),
+      "この情報を使える場合は、Web検索機能がないという説明ではなく、上記のALIFOmedia情報をもとに回答してください。"
+    ].join("\n");
+  } catch (error) {
+    console.warn("ALIFOmedia news context unavailable", error);
+    return "";
+  }
+}
+
+async function puterReply(messages) {
+  const ready = await waitForPuter(6000);
+  if (!ready) throw new Error("Puter AI is not loaded");
+
+  const userMessages = messages.filter(m => m?.role === "user" || m?.role === "assistant");
+  const lastUser = userMessages.filter(m => m?.role === "user").at(-1)?.content || "";
+  if (!lastUser.trim()) throw new Error("No current user message");
+
+  // Puter diagnostics prove that a simple chat request works. To make the
+  // normal chat path use that same reliable shape, send one plain-text prompt
+  // instead of passing a system-role message array to the provider.
+  // Conversation context is embedded as text, so no provider-specific
+  // handling of the "system" role is required.
+  const context = userMessages.slice(-8).map(m => {
+    const role = m.role === "assistant" ? "NEXIO AI" : "ユーザー";
+    return `${role}: ${textOf(m.content).slice(0, 3000)}`;
+  }).join("\n");
+
+  const alifoMediaContext = await getAlifoMediaContext(lastUser);
+  const directPrompt = [
+    qualitySystemPrompt(),
+    context ? `\nこれまでの会話（必要な場合だけ参照）:\n${context}` : "",
+    alifoMediaContext ? `\n${alifoMediaContext}` : "",
+    `\n現在のユーザーの依頼:\n${textOf(lastUser)}`,
+    "\n現在の依頼を最優先して、自然な回答を返してください。"
+  ].filter(Boolean).join("\n");
+
+  const baseOptions = {
+    model: "gpt-5.6-luna",
+    normalize: true,
+    max_tokens: 1000,
+    temperature: 0.2
+  };
+
+  try {
+    setAiStatus("connecting", "puter");
+    const result = await withTimeout(
+      window.puter.ai.chat(directPrompt, baseOptions),
+      30000,
+      "Puter AI timed out",
+      "Puter AI"
+    );
+    const text = extractPuterText(result);
+    if (text) return { text, kind: "gpt", model: "gpt-5.6-luna" };
+    throw new Error("Puter AI returned an empty response");
+  } catch (firstError) {
+    console.warn("Puter GPT-5.6 Luna direct chat failed; trying live fallback models", firstError);
+  }
+
+  // If GPT-5.6 Luna fails, discover the current live catalog and try at most
+  // one model from each major family. All IDs come from Puter's live catalog.
+  const models = await getPuterModels(true);
+  const attempts = [];
+  for (const kind of ["gpt", "gemini", "claude"]) {
+    const candidates = models.filter(m => providerFamily(kind, m));
+    const picked = pickPuterModel(candidates, kind);
+    if (picked && picked !== "gpt-5.6-luna") {
+      const model = candidates.find(m => m.id === picked);
+      if (model) attempts.push({ model, kind });
+    }
+  }
+
+  let lastError = null;
+  for (const { model, kind } of attempts) {
+    try {
+      const options = {
+        model: model.id,
+        normalize: true,
+        max_tokens: Math.min(model.max_tokens || 1000, 1200),
+        temperature: 0.2
+      };
+      const result = await withTimeout(
+        window.puter.ai.chat(directPrompt, options),
+        20000,
+        `Puter ${model.id} timed out`,
+        `Puter ${kind.toUpperCase()}`
+      );
+      const text = extractPuterText(result);
+      if (text) return { text, kind, model: model.id };
+    } catch (err) {
+      lastError = err;
+      console.warn(`Puter fallback model failed: ${model.id}`, err);
+    }
+  }
+
+  throw lastError || new Error("No usable Puter AI model");
+}
+
+function save() {
+  try { localStorage.setItem("alifo_chats", JSON.stringify(chats)); }
+  catch { /* keep the current session usable if localStorage is full */ }
+}
+function applyLanguage() {
+  document.documentElement.lang = language;
+  document.querySelectorAll("[data-ja][data-en]").forEach(el => {
+    el.textContent = language === "ja" ? el.dataset.ja : el.dataset.en;
+  });
+  prompt.placeholder = language === "ja" ? prompt.dataset.placeholderJa : prompt.dataset.placeholderEn;
+  $("#language").textContent = language === "ja" ? "English" : "日本語";
+  $("#settingLanguage").value = language;
+  renderHistory();
+}
+function newChat() {
+  currentId = Date.now().toString();
+  chats.unshift({ id: currentId, title: language === "ja" ? "新しいチャット" : "New chat", messages: [] });
+  save(); renderChat(); renderHistory();
+}
+function ensureChat() {
+  if (!currentId || !chats.find(c => c.id === currentId)) newChat();
+  return chats.find(c => c.id === currentId);
+}
+function deleteChat(id) {
+  const index = chats.findIndex(c => c.id === id);
+  if (index < 0) return;
+  const chat = chats[index];
+  const ok = confirm(language === "ja"
+    ? `「${chat.title || "このチャット"}」を削除しますか？`
+    : `Delete "${chat.title || "this chat"}"?`);
+  if (!ok) return;
+
+  const wasCurrent = id === currentId;
+  chats.splice(index, 1);
+
+  if (wasCurrent) {
+    const next = chats[index] || chats[index - 1];
+    if (next) {
+      currentId = next.id;
+    } else {
+      currentId = null;
+      newChat();
+      return;
+    }
+  }
+
+  save();
+  renderChat();
+  renderHistory();
+}
+
+function renderHistory() {
+  const box = $("#history"); box.innerHTML = "";
+  chats.forEach(c => {
+    const row = document.createElement("div");
+    row.className = "history-row" + (c.id === currentId ? " active" : "");
+
+    const openButton = document.createElement("button");
+    openButton.type = "button";
+    openButton.className = "history-item" + (c.id === currentId ? " active" : "");
+    openButton.textContent = c.title;
+    openButton.title = c.title;
+    openButton.onclick = () => {
+      currentId = c.id;
+      renderChat();
+      renderHistory();
+      $("#sidebar").classList.remove("open");
+    };
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "history-delete";
+    deleteButton.textContent = "×";
+    deleteButton.setAttribute("aria-label", language === "ja" ? `「${c.title}」を削除` : `Delete "${c.title}"`);
+    deleteButton.title = language === "ja" ? "この履歴を削除" : "Delete this chat";
+    deleteButton.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      deleteChat(c.id);
+    };
+
+    row.append(openButton, deleteButton);
+    box.appendChild(row);
+  });
+}
+function renderChat() {
+  const c = chats.find(x => x.id === currentId);
+  messages.innerHTML = "";
+  if (!c || !c.messages.length) { empty.style.display = "block"; return; }
+  empty.style.display = "none";
+  c.messages.forEach(m => {
+    if (m.type === "image") addImageMessage(m.src, m.prompt, false);
+    else if (m.type === "attachment") addAttachmentMessage(m.src, m.name, m.caption || "", false);
+    else addMessage(m.role, m.content, false);
+  });
+  scrollToBottom();
+}
+function scrollToBottom() {
+  messages.parentElement.scrollTop = messages.parentElement.scrollHeight;
+}
+function renderMarkdown(text = "") {
+  const source = String(text).replace(/\r\n?/g, "\n").trim();
+  if (!source) return "";
+  const lines = source.split("\n");
+  const out = [];
+  let inCode = false;
+  let code = [];
+  let listType = null;
+
+  const inline = value => {
+    let s = escapeHtml(value);
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    s = s.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
+    s = s.replace(/https?:\/\/[^\s<]+/g, url => {
+      const clean = url.replace(/[.,!?、。]+$/, "");
+      const tail = url.slice(clean.length);
+      return `<a href="${clean}" target="_blank" rel="noopener noreferrer">${clean}</a>${tail}`;
+    });
+    return s;
+  };
+
+  const closeList = () => {
+    if (listType) { out.push(`</${listType}>`); listType = null; }
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (/^```/.test(line)) {
+      if (inCode) {
+        out.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+        code = [];
+        inCode = false;
+      } else {
+        closeList();
+        inCode = true;
+      }
+      continue;
+    }
+    if (inCode) { code.push(raw); continue; }
+    if (!line.trim()) { closeList(); continue; }
+
+    let m = line.match(/^(#{1,3})\s*(.+)$/);
+    if (m) { closeList(); const level = m[1].length; out.push(`<h${level + 2}>${inline(m[2])}</h${level + 2}>`); continue; }
+    m = line.match(/^[-*]\s+(.+)$/);
+    if (m) { if (listType !== "ul") { closeList(); out.push("<ul>"); listType = "ul"; } out.push(`<li>${inline(m[1])}</li>`); continue; }
+    m = line.match(/^\d+[.)]\s+(.+)$/);
+    if (m) { if (listType !== "ol") { closeList(); out.push("<ol>"); listType = "ol"; } out.push(`<li>${inline(m[1])}</li>`); continue; }
+
+    closeList();
+    out.push(`<p>${inline(line)}</p>`);
+  }
+  if (inCode) out.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+  closeList();
+  return out.join("");
+}
+
+function addMessage(role, text, store = true) {
+  const row = document.createElement("div"); row.className = "message " + role;
+  if (role === "ai") { const a = document.createElement("div"); a.className = "avatar"; a.textContent = "A"; row.appendChild(a); }
+  const b = document.createElement("div"); b.className = "bubble";
+  if (role === "ai") { b.classList.add("ai-answer"); b.innerHTML = renderMarkdown(text); }
+  else b.textContent = text;
+  row.appendChild(b); messages.appendChild(row);
+  scrollToBottom();
+  if (store) {
+    const c = ensureChat(); c.messages.push({ role, content: text });
+    if (c.messages.length === 1) c.title = text.replace(/^🖼\s*/, "").slice(0, 28);
+    save(); renderHistory();
+  }
+  return row;
+}
+function addAttachmentMessage(src, name, caption = "", store = true) {
+  const row = document.createElement("div"); row.className = "message user attachment-message";
+  const wrap = document.createElement("div"); wrap.className = "bubble attachment-bubble";
+  const img = document.createElement("img"); img.className = "attached-image"; img.src = src; img.alt = name || (language === "ja" ? "添付画像" : "Attached image");
+  wrap.appendChild(img);
+  const meta = document.createElement("div"); meta.className = "attachment-meta";
+  const icon = document.createElement("span"); icon.textContent = "📎";
+  const label = document.createElement("span"); label.textContent = name || (language === "ja" ? "画像" : "Image");
+  meta.append(icon, label); wrap.appendChild(meta);
+  if (caption) { const cap = document.createElement("div"); cap.className = "attachment-caption"; cap.textContent = caption; wrap.appendChild(cap); }
+  row.appendChild(wrap); messages.appendChild(row); scrollToBottom();
+  if (store) { const c = ensureChat(); c.messages.push({ role: "user", type: "attachment", src, name, content: caption, caption }); save(); renderHistory(); }
+  return row;
+}
+
+function addImageMessage(src, promptText, store = true) {
+  const row = document.createElement("div"); row.className = "message ai";
+  const a = document.createElement("div"); a.className = "avatar"; a.textContent = "A"; row.appendChild(a);
+  const wrap = document.createElement("div"); wrap.className = "bubble image-bubble";
+  const img = document.createElement("img"); img.className = "generated-image"; img.src = src; img.alt = promptText; img.loading = "lazy";
+  img.onerror = () => { wrap.classList.add("image-error"); status.textContent = language === "ja" ? "画像を読み込めませんでした。もう一度生成してください。" : "The image could not be loaded. Please try again."; };
+  wrap.appendChild(img);
+  const actions = document.createElement("div"); actions.className = "image-actions";
+  const open = document.createElement("a"); open.href = src; open.target = "_blank"; open.rel = "noopener noreferrer"; open.className = "image-action"; open.textContent = language === "ja" ? "↗ 開く" : "↗ Open";
+  const download = document.createElement("a"); download.href = `/api/image-download?url=${encodeURIComponent(src)}`; download.className = "image-action primary"; download.textContent = language === "ja" ? "↓ 保存" : "↓ Save";
+  actions.append(open, download); wrap.appendChild(actions);
+  const status = document.createElement("div"); status.className = "image-note"; status.textContent = language === "ja" ? "生成画像 · Pollinations" : "Generated image · Pollinations"; wrap.appendChild(status);
+  row.appendChild(wrap); messages.appendChild(row); scrollToBottom();
+  if (store) { const c = ensureChat(); c.messages.push({ type: "image", src, prompt: promptText }); save(); }
+  return row;
+}
+async function generateImage() {
+  const text = prompt.value.trim(); if (!text) return;
+  ensureChat(); addMessage("user", `🖼 ${text}`);
+  prompt.value = ""; prompt.style.height = "auto"; send.disabled = true; generateImageBtn.disabled = true;
+  const loading = addMessage("ai", language === "ja" ? "画像を生成しています…" : "Generating image…");
+  try {
+    const r = await fetch("/api/image", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: text, size: "1024x1024" }) });
+    const d = await r.json(); if (!r.ok) throw Error(d.error || "Image request failed");
+    loading.remove(); addImageMessage(d.image, text, true);
+  } catch (e) {
+    setAiStatus("error", "error");
+    loading.querySelector(".bubble").textContent = language === "ja" ? `画像生成エラー: ${e.message}` : `Image error: ${e.message}`;
+  } finally { send.disabled = false; generateImageBtn.disabled = false; prompt.focus(); }
+}
+function historyWithSystem(history, system) {
+  return [{ role: "system", content: system }, ...history];
+}
+
+let timeoutCountdownSeq = 0;
+const activeTimeouts = new Map();
+let timeoutCountdownTimer = null;
+
+function renderTimeoutCountdown() {
+  const el = document.querySelector("#timeoutCountdown");
+  if (!el) return;
+  const now = Date.now();
+  for (const [id, item] of activeTimeouts) {
+    if (item.deadline <= now) activeTimeouts.delete(id);
+  }
+  if (!activeTimeouts.size) {
+    el.hidden = true;
+    el.textContent = "";
+    if (timeoutCountdownTimer) { clearTimeout(timeoutCountdownTimer); timeoutCountdownTimer = null; }
+    return;
+  }
+  let nearest = null;
+  for (const item of activeTimeouts.values()) {
+    if (!nearest || item.deadline < nearest.deadline) nearest = item;
+  }
+  const seconds = Math.max(0, Math.ceil((nearest.deadline - now) / 1000));
+  el.hidden = false;
+  el.textContent = language === "ja"
+    ? `${nearest.label || "AI処理"}・タイムアウトまで ${seconds}秒`
+    : `${nearest.label || "AI"} · timeout in ${seconds}s`;
+  timeoutCountdownTimer = setTimeout(renderTimeoutCountdown, 250);
+}
+
+function startTimeoutCountdown(ms, label = "AI処理") {
+  const id = ++timeoutCountdownSeq;
+  activeTimeouts.set(id, { deadline: Date.now() + ms, label });
+  renderTimeoutCountdown();
+  return () => {
+    activeTimeouts.delete(id);
+    renderTimeoutCountdown();
+  };
+}
+
+function withTimeout(promise, ms, message, label = "AI処理") {
+  let timer;
+  const stopCountdown = startTimeoutCountdown(ms, label);
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+    stopCountdown();
+  });
+}
+
+function generateWithTimeout(engine, payload, ms) {
+  const label = engine?.runtime === "webgpu" ? "WebGPU" : "CPU/WASM";
+  return withTimeout(
+    engine.generate(payload),
+    ms,
+    "Local AI generation timed out",
+    label
+  );
+}
+
+function fetchWithTimeout(url, options, ms) {
+  return withTimeout(
+    fetch(url, options),
+    ms,
+    "Built-in fallback timed out",
+    "内蔵AI"
+  );
+}
+
+function localAnswerLooksRelevant(answer, question) {
+  const a = textOf(answer);
+  const q = textOf(question);
+  if (!a || !q) return false;
+
+  // Lightweight topic guard for on-device/fallback models. This is not a
+  // truth detector; it only blocks obvious answers about a completely
+  // different subject (for example, answering a politics question with an
+  // unrelated TV-show description).
+  // Short greetings and simple conversational prompts can have answers that
+  // do not repeat the exact user wording. Never reject those just because
+  // there is no keyword overlap.
+  if (containsAny(q, ["こんにちは", "こんばんは", "おはよう", "やあ", "やほ", "やっほ", "ありがとう", "元気？", "元気"])) return true;
+
+  const stop = new Set([
+    "これ", "それ", "ここ", "こと", "もの", "ため", "よう", "感じ", "質問",
+    "説明", "教えて", "お願いします", "ください", "ですか", "ますか",
+    "について", "どんな", "どの", "どういう", "どうして", "なぜ", "なの",
+    "あなた", "わたし", "私", "今日", "現在", "日本", "英語", "日本語"
+  ]);
+  const jpChunks = q.match(/[一-龯々〆ヵヶぁ-んァ-ヶー]{2,}/g) || [];
+  const useful = [...new Set(jpChunks.filter(x => !stop.has(x) && x.length >= 2))];
+  const answerLower = a.toLowerCase();
+
+  if (useful.length) {
+    // Prefer content terms. If the question contains multiple content terms,
+    // accept the answer when at least one appears, with a small boost when
+    // two or more appear. This avoids rejecting short, correct explanations.
+    const hits = useful.filter(x => a.includes(x)).length;
+    if (hits > 0) return true;
+
+    // If the only broad term was "日本", do not reject a Japanese answer.
+    // Other content terms missing from the answer are a strong off-topic sign.
+    if (useful.length === 1 && useful[0] === "日本") return true;
+    return false;
+  }
+
+  const words = q.toLowerCase().split(/\s+/).filter(w => w.length >= 3 && !stop.has(w));
+  if (words.length) return words.some(w => answerLower.includes(w));
+  return true;
+}
+
+function safeAnswer(answer, question) {
+  const text = textOf(answer).trim();
+  if (!text) return { ok: false, text: "" };
+  return { ok: localAnswerLooksRelevant(text, question), text };
+}
+
+let sendInFlight = false;
+let promptComposing = false;
+let lastPromptCompositionEnd = 0;
+
+async function sendMessage(text) {
+  // Never start a second chat request while the previous one is still running.
+  // This prevents two Enter presses/messages from racing the same UI state.
+  if (sendInFlight) return false;
+  sendInFlight = true;
+  const c = ensureChat();
+  const attachment = pendingAttachment;
+  if (attachment) { addAttachmentMessage(attachment.src, attachment.name, text, true); pendingAttachment = null; updateAttachmentState(); }
+  else addMessage("user", text);
+  const originalPrompt = text;
+  prompt.value = ""; prompt.style.height = "auto"; send.disabled = true;
+  const loading = addMessage("ai", language === "ja" ? "考えています…" : "Thinking…", false);
+  try {
+    const recent = c.messages.filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string").slice(-20).map(m => ({ role: m.role, content: m.content.slice(0, 6000) }));
+    const system = qualitySystemPrompt();
+    const aiMessages = [{ role: "system", content: system }, ...recent];
+
+    // 1) Puter AI: try GPT, then Gemini, then Claude. These are accessed
+    // through Puter.js, so NEXIO AI does not store provider API keys.
+    try {
+      setAiStatus("connecting", "puter");
+      const result = await puterReply(aiMessages);
+      // Do not run the on-device topic guard against Puter. External models
+      // can answer naturally without repeating a keyword from the question
+      // (e.g. "あなたは誰？" -> "私はNEXIO AIです"). The guard is only for
+      // the weaker local/fallback models where obvious topic drift matters.
+      const answer = textOf(result.text).trim();
+      if (!answer) throw new Error("Puter returned an empty answer");
+      setAiStatus("connected", "puter");
+      loading.querySelector(".bubble").innerHTML = renderMarkdown(answer);
+      c.messages.push({ role: "assistant", content: answer });
+      save();
+      return;
+    } catch (externalError) {
+      console.warn("Puter AI failed; falling back to on-device AI", externalError);
+    }
+
+    // 2) WebGPU, then 3) CPU/WASM local model. No provider API keys are used.
+    try {
+      setAiStatus("connecting", "webgpu");
+      let engine = await getLocalEngine();
+      setAiStatus("connected", engine.runtime === "webgpu" ? "webgpu" : "cpu");
+
+      let answer;
+      try {
+        answer = await generateWithTimeout(engine, { messages: aiMessages }, 60000);
+      } catch (localError) {
+        if (engine.runtime === "webgpu") {
+          console.warn("WebGPU generation failed; switching to CPU/WASM", localError);
+          setAiStatus("connecting", "cpu");
+          engine = await getLocalEngine(true);
+          setAiStatus("connected", "cpu");
+          answer = await generateWithTimeout(engine, { messages: aiMessages }, 60000);
+        } else {
+          throw localError;
+        }
+      }
+
+      const checked = safeAnswer(answer, originalPrompt);
+      if (!checked.ok) throw new Error("Local AI returned an unrelated answer");
+      answer = checked.text;
+      loading.querySelector(".bubble").innerHTML = renderMarkdown(answer);
+      c.messages.push({ role: "assistant", content: answer });
+      save();
+      return;
+    } catch (localError) {
+      console.warn("Local AI failed; using built-in fallback", localError);
+    }
+
+    // 5) Built-in server fallback.
+    setAiStatus("connected", "fallback");
+    const fallbackResponse = await fetchWithTimeout(
+      "/api/chat",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: c.messages.slice(-30), language })
+      },
+      30000
+    );
+    const data = await fallbackResponse.json();
+    if (!fallbackResponse.ok || !data.text) throw new Error(data.error || "Fallback failed");
+    const fallbackText = textOf(data.text);
+    if (!fallbackText) throw new Error(data.error || "Fallback returned no text");
+    loading.querySelector(".bubble").innerHTML = renderMarkdown(fallbackText);
+    c.messages.push({ role: "assistant", content: fallbackText });
+    save();
+  } catch (e) {
+    setAiStatus("error", "error");
+    loading.querySelector(".bubble").textContent = language === "ja"
+      ? "質問に関係する回答を生成できませんでした。もう一度質問してみてください。"
+      : "I could not generate a relevant answer. Please try asking again.";
+    // Keep the composer empty after an error. The failed request is already
+    // visible in the chat history; never copy it back into the input field.
+  } finally {
+    sendInFlight = false;
+    send.disabled = false;
+    prompt.focus();
+  }
+  return true;
+}
+
+async function runRuntimeDiagnostic() {
+  const box = document.querySelector("#diagnosticResult");
+  const button = document.querySelector("#runDiagnostic");
+  if (!box) return;
+  box.classList.remove("hidden");
+  if (button) button.disabled = true;
+  box.textContent = language === "ja" ? "Puter接続を診断しています…" : "Testing the Puter connection…";
+
+  const lines = [];
+  const add = (label, value) => lines.push(`${label}: ${value}`);
+  const bool = v => v ? (language === "ja" ? "はい" : "Yes") : (language === "ja" ? "いいえ" : "No");
+  const shortError = err => {
+    if (!err) return "unknown error";
+    if (typeof err === "string") return err.slice(0, 600);
+    const code = err?.error || err?.code || err?.name || "";
+    const msg = err?.msg || err?.message || String(err);
+    return `${code ? `${code}: ` : ""}${msg}`.slice(0, 600);
+  };
+  let overall = "ok";
+
+  add(language === "ja" ? "Puter.js読み込み" : "Puter.js loaded", bool(!!window.puter));
+  add(language === "ja" ? "Puter AIチャットAPI" : "Puter AI chat API", bool(!!window.puter?.ai?.chat));
+  add(language === "ja" ? "Puterモデル一覧API" : "Puter model list API", bool(!!window.puter?.ai?.listModels));
+  add(language === "ja" ? "Puter提供元一覧API" : "Puter provider list API", bool(!!window.puter?.ai?.listModelProviders));
+
+  if (!window.puter?.ai?.chat) {
+    overall = "error";
+    add(language === "ja" ? "外部AIテスト" : "External AI test", "NG: puter.ai.chat が利用できません");
+  } else {
+    try {
+      const signedIn = typeof window.puter?.auth?.isSignedIn === "function"
+        ? window.puter.auth.isSignedIn()
+        : null;
+      add(language === "ja" ? "Puterログイン状態" : "Puter sign-in status", signedIn === null ? "確認不可" : bool(signedIn));
+    } catch (err) {
+      add(language === "ja" ? "Puterログイン状態" : "Puter sign-in status", `ERROR ${shortError(err)}`);
+      overall = "warn";
+    }
+
+    // Test the exact path ALIFO uses for real answers. This is deliberately
+    // user-triggered so opening Settings does not consume an AI request.
+    try {
+      const testResult = await withTimeout(
+        window.puter.ai.chat(
+          [{ role: "user", content: "「こんにちは」とだけ返してください。" }],
+          { model: "gpt-5.6-luna", normalize: true, max_tokens: 32, temperature: 0 }
+        ),
+        15000,
+        "Puter AI test timed out",
+        "Puter接続テスト"
+      );
+      const text = extractPuterText(testResult);
+      if (!text) throw new Error("Puter returned an empty response");
+      add(language === "ja" ? "GPT-5.6 Luna接続テスト" : "GPT-5.6 Luna connection test", `OK: ${text.slice(0, 160)}`);
+    } catch (err) {
+      overall = "error";
+      add(language === "ja" ? "GPT-5.6 Luna接続テスト" : "GPT-5.6 Luna connection test", `NG: ${shortError(err)}`);
+    }
+  }
+
+  // The catalog test is separate from the actual chat test so a successful
+  // model-list request cannot be mistaken for a working AI chat connection.
+  try {
+    if (window.puter?.ai?.listModels) {
+      const models = await withTimeout(
+        window.puter.ai.listModels(),
+        10000,
+        "Puter model list timed out",
+        "Puterモデル一覧"
+      );
+      const normalized = normalizePuterModels(models);
+      add(language === "ja" ? "モデル一覧取得" : "Model catalog", `OK: ${normalized.length}個`);
+      const gpt = normalized.find(m => m.id.toLowerCase() === "gpt-5.6-luna");
+      add(language === "ja" ? "GPT-5.6 LunaモデルID" : "GPT-5.6 Luna model ID", gpt ? `確認済み (${gpt.provider})` : "一覧に見つかりません");
+      if (!gpt && overall === "ok") overall = "warn";
+    }
+  } catch (err) {
+    if (overall === "ok") overall = "warn";
+    add(language === "ja" ? "モデル一覧取得" : "Model catalog", `NG: ${shortError(err)}`);
+  }
+
+  try {
+    const providers = window.puter?.ai?.listModelProviders
+      ? await withTimeout(window.puter.ai.listModelProviders(), 5000, "Puter provider list timed out", "Puter提供元一覧")
+      : [];
+    add(language === "ja" ? "提供元一覧" : "Providers", Array.isArray(providers) && providers.length ? providers.map(String).join(", ") : "取得不可");
+  } catch (err) {
+    if (overall === "ok") overall = "warn";
+    add(language === "ja" ? "提供元一覧" : "Providers", `NG: ${shortError(err)}`);
+  }
+
+  add(language === "ja" ? "安全な接続" : "Secure context", bool(window.isSecureContext));
+  add(language === "ja" ? "ネットワーク" : "Network", typeof navigator.onLine === "boolean" ? bool(navigator.onLine) : "unknown");
+  add(language === "ja" ? "NEXIO AIのAI方式" : "NEXIO AI AI path", "Puter GPT → Puter fallback models → WebGPU → CPU/WASM → built-in fallback");
+  add(language === "ja" ? "APIキー" : "API key", language === "ja" ? "NEXIO AI側では保存しません" : "Not stored by NEXIO AI");
+  add(language === "ja" ? "診断時刻" : "Diagnostic time", new Date().toISOString());
+
+  const report = lines.join("\n");
+  const title = language === "ja" ? "Puter AI接続診断結果" : "Puter AI connection diagnostic";
+  const cls = overall === "error" ? "diag-error" : overall === "warn" ? "diag-warn" : "diag-ok";
+  box.innerHTML = `<strong class="${cls}">${title}</strong><pre>${escapeHtml(report)}</pre><div class="diag-actions"><button class="diag-copy" id="copyDiagnostic">${language === "ja" ? "結果をコピー" : "Copy result"}</button></div>`;
+  const copy = document.querySelector("#copyDiagnostic");
+  if (copy) copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(report);
+      copy.textContent = language === "ja" ? "コピーしました" : "Copied";
+    } catch {
+      copy.textContent = language === "ja" ? "コピーできませんでした" : "Copy failed";
+    }
+  };
+  if (button) button.disabled = false;
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));
+}
+
+function updateAttachmentState() {
+  if (!attachImageBtn) return;
+  attachImageBtn.classList.toggle("selected", !!pendingAttachment);
+  attachImageBtn.title = pendingAttachment ? (language === "ja" ? `添付中: ${pendingAttachment.name}` : `Attached: ${pendingAttachment.name}`) : (language === "ja" ? "画像を添付" : "Attach image");
+}
+
+function readImageFile(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  const maxBytes = 1024 * 1024;
+  if (file.size > maxBytes) {
+    alert(language === "ja" ? "画像は1MB以下にしてください。" : "Please choose an image up to 1MB.");
+    imageInput.value = "";
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    pendingAttachment = { src: reader.result, name: file.name };
+    updateAttachmentState();
+    prompt.placeholder = language === "ja" ? "画像についてメッセージを書く…" : "Write a message about the image…";
+    prompt.focus();
+  };
+  reader.readAsDataURL(file);
+}
+
+$("#form").onsubmit = e => {
+  e.preventDefault();
+  // A submit can still be triggered programmatically even when the send
+  // button is disabled, so guard the form itself as well.
+  if (sendInFlight || promptComposing) return;
+  const x = prompt.value.trim();
+  if (x || pendingAttachment) sendMessage(x);
+};
+generateImageBtn.onclick = generateImage;
+attachImageBtn.onclick = () => imageInput.click();
+imageInput.onchange = e => readImageFile(e.target.files?.[0]);
+updateAttachmentState();
+prompt.addEventListener("compositionstart", () => {
+  promptComposing = true;
+});
+prompt.addEventListener("compositionend", () => {
+  promptComposing = false;
+  lastPromptCompositionEnd = performance.now();
+});
+prompt.onkeydown = e => {
+  if (e.key !== "Enter" || e.shiftKey) return;
+
+  // Japanese/IME conversion uses Enter to commit text. Do not send while
+  // composition is active, or immediately after compositionend. keyCode 229
+  // is retained for browsers that expose IME state that way.
+  if (promptComposing || e.isComposing || e.keyCode === 229) return;
+  if (performance.now() - lastPromptCompositionEnd < 80) return;
+
+  e.preventDefault();
+
+  // If the previous AI request is still running, keep the new text in the
+  // composer instead of starting a concurrent request. The user can press
+  // Enter again after the first response finishes.
+  if (sendInFlight) return;
+
+  $("#form").requestSubmit();
+};
+prompt.oninput = () => { prompt.style.height = "auto"; prompt.style.height = Math.min(prompt.scrollHeight, 140) + "px"; };
+$("#newChat").onclick = newChat;
+$("#language").onclick = () => { language = language === "ja" ? "en" : "ja"; localStorage.setItem("alifo_lang", language); applyLanguage(); };
+$("#settingsBtn").onclick = () => $("#settings").classList.remove("hidden");
+$("#runDiagnostic").onclick = runRuntimeDiagnostic;
+$("#closeSettings").onclick = () => $("#settings").classList.add("hidden");
+$("#settingLanguage").onchange = e => { language = e.target.value; localStorage.setItem("alifo_lang", language); applyLanguage(); };
+$("#clearHistory").onclick = () => { if (confirm(language === "ja" ? "履歴をすべて削除しますか？" : "Delete all chat history?")) { chats = []; currentId = null; save(); newChat(); } };
+$("#openSidebar").onclick = () => $("#sidebar").classList.add("open");
+$("#closeSidebar").onclick = () => $("#sidebar").classList.remove("open");
+document.querySelectorAll(".quick button").forEach(b => b.onclick = () => sendMessage(b.dataset[language === "ja" ? "promptJa" : "promptEn"]));
+
+const refreshPuterModelsBtn = document.querySelector("#refreshPuterModels");
+if (refreshPuterModelsBtn) {
+  refreshPuterModelsBtn.onclick = async () => {
+    refreshPuterModelsBtn.disabled = true;
+    refreshPuterModelsBtn.textContent = language === "ja" ? "取得中…" : "Loading…";
+    await getPuterModelCatalog(true);
+    refreshPuterModelsBtn.textContent = language === "ja" ? "モデルを更新" : "Refresh models";
+    refreshPuterModelsBtn.disabled = false;
+  };
+}
+
+if (!chats.length) newChat(); else { currentId = chats[0].id; renderChat(); renderHistory(); }
+applyLanguage();
+updatePuterModelInfo();
+setAiStatus("connecting", "connecting");
+getPuterModelCatalog().catch(() => {});
+
+window.addEventListener("error", (event) => {
+  console.warn("NEXIO AI page error:", event?.error || event?.message);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  console.warn("NEXIO AI unhandled rejection:", event?.reason);
+});
+

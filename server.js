@@ -1,0 +1,669 @@
+import express from "express";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.disable("x-powered-by");
+app.use(express.json({ limit: "2mb" }));
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Content-Security-Policy", [
+    "default-src 'self'",
+    "script-src 'self' https://cdn.jsdelivr.net https://js.puter.com 'wasm-unsafe-eval'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: https://image.pollinations.ai https://huggingface.co https://*.huggingface.co",
+    "connect-src 'self' https://js.puter.com https://*.puter.com https://cdn.jsdelivr.net https://image.pollinations.ai https://huggingface.co https://*.huggingface.co https://*.hf.co https://raw.githubusercontent.com https://github.com https://objects.githubusercontent.com",
+    "worker-src 'self' blob:",
+    "font-src 'self' data:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'"
+  ].join("; "));
+  next();
+});
+
+const rateBuckets = new Map();
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  const old = rateBuckets.get(key);
+  if (!old || now - old.start >= windowMs) {
+    rateBuckets.set(key, { start: now, count: 1 });
+    return true;
+  }
+  if (old.count >= max) return false;
+  old.count += 1;
+  return true;
+}
+function clientKey(req, scope) {
+  return `${scope}:${req.ip || req.socket.remoteAddress || "unknown"}`;
+}
+
+app.use(express.static(path.join(__dirname, "dist"), { extensions: ["html"] }));
+
+function textOf(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+function hasRecentAttachment(messages = []) {
+  return messages.slice(-4).some(m => m?.type === "attachment" || m?.attachment);
+}
+
+function lastUser(messages = []) {
+  return messages.filter(m => m?.role === "user").at(-1)?.content?.trim() || "";
+}
+function userHistory(messages = []) {
+  return messages.filter(m => m?.role === "user").map(m => textOf(m.content)).filter(Boolean);
+}
+function containsAny(text, words) {
+  const t = text.toLowerCase();
+  return words.some(w => t.includes(w.toLowerCase()));
+}
+function numbered(items) {
+  return items.map((x, i) => `${i + 1}. ${x}`).join("\n");
+}
+function isQuestion(q) {
+  return /[?？]$/.test(q) || containsAny(q, ["なぜ", "どうして", "どうやって", "とは", "って何", "教えて", "分かる", "わかる"]);
+}
+function isCasual(q) {
+  return containsAny(q, ["やほ", "やっほ", "こんにちは", "こんばんは", "おはよう", "元気", "暇", "話そ", "話そう", "雑談", "眠い", "疲れた", "うれしい", "嬉しい", "悲しい", "すごい", "笑"]);
+}
+function isExplicitNewTask(q) {
+  return containsAny(q, [
+    "作って", "作ってほしい", "作ってください", "書いて", "書いてほしい", "書いてください",
+    "作文", "文章を", "文を", "考えて", "考えてほしい", "教えて", "説明して",
+    "まとめて", "要約して", "翻訳して", "直して", "作成して", "コードを書いて"
+  ]);
+}
+function extractTopic(q) {
+  return textOf(q
+    .replace(/^(?:ねえ|ねぇ|ちょっと|えーと|えっと|あの|もしもし)[、,。\s]*/i, "")
+    .replace(/[？?！!]$/g, ""));
+}
+function recentContext(messages) {
+  const u = userHistory(messages);
+  return u.slice(-4);
+}
+
+function isWritingContext(messages = []) {
+  const recent = messages.slice(-8).map(m => textOf(m?.content));
+  return recent.some(text => containsAny(text, [
+    "作文を作るよ", "まずテーマを教えて", "作文を作って", "作文を書いて",
+    "文章を作って", "文章を書いて", "作文のテーマ", "作文にできる"
+  ]));
+}
+
+function looksLikeWritingTopic(q = "") {
+  const t = textOf(q);
+  if (!t || t.length > 40 || /[?？]$/.test(t)) return false;
+  return !containsAny(t, [
+    "もっと", "詳しく", "くわしく", "短く", "簡単に", "例を", "具体例",
+    "ありがとう", "こんにちは", "こんばんは", "おはよう", "それ", "これ"
+  ]);
+}
+
+function writingTopicReply(topic) {
+  const t = extractTopic(topic);
+  const title = t || "思い出";
+  const examples = {
+    "夏休みの思い出": `「夏休みの思い出」についての作文だね！😊\n\n【例文】\n\nタイトル：夏休みの思い出\n\n私の夏休みの一番の思い出は、家族と出かけたことです。\n\n朝からみんなで準備をして、いつもより少し早く家を出ました。目的地に着くと、きれいな景色を見たり、おいしいものを食べたりして、楽しい時間を過ごしました。特に心に残っているのは、家族みんなで笑いながら話したことです。\n\n最初は少し疲れましたが、一緒に過ごすうちに元気になりました。普段は学校や仕事などで忙しい家族と、ゆっくり話せたこともよかったです。\n\nこの夏休みを通して、家族と過ごす時間の大切さを感じました。これからもみんなで楽しい思い出を作っていきたいです。\n\n実際の思い出に合わせて、行った場所・したこと・一番楽しかったことを入れると、もっと自分らしい作文になるよ。`,
+    "将来の夢": `「将来の夢」についての作文だね！😊\n\n【例文】\n\nタイトル：私の将来の夢\n\n私には、将来やってみたいことがあります。まだはっきり決まってはいませんが、人の役に立つ仕事をしたいと思っています。\n\nその理由は、誰かに「ありがとう」と言ってもらえたときに、うれしい気持ちになるからです。学校生活でも、友達が困っているときに手伝うと、相手だけでなく自分もうれしくなります。\n\nこれからいろいろなことを経験して、自分が本当にやりたいことを見つけたいです。そのために、勉強や新しいことへの挑戦を大切にしたいと思います。\n\nいつか、自分の力で誰かを笑顔にできる人になりたいです。`,
+  };
+  return examples[title] || `「${title}」についての作文だね！😊\n\nまずは書きやすい形で例を作るよ。\n\n【作文の例】\n\nタイトル：${title}\n\n私が「${title}」について考えてみて、まず思ったのは、身近な出来事にも大切な意味があるということです。\n\nそのときに感じたことや、特に心に残ったことを思い出すと、いろいろなことが見えてきます。楽しかったことだけでなく、難しかったことや、そこから学んだことも大切な思い出です。\n\nこれからも一つ一つの経験を大切にして、いろいろなことに挑戦していきたいです。\n\n実際の出来事を2〜3個教えてくれれば、もっと自分らしい作文に書き換えられるよ。`;
+}
+
+function followupJapanese(q, history) {
+  const lower = q.toLowerCase();
+  if (containsAny(lower, ["もっと", "詳しく", "くわしく"])) return "もちろん。もう少し具体的にすると、ポイントを分けて順番に説明できるよ。どの部分を詳しくしたいか指定してくれたら、そこに絞るね。";
+  if (containsAny(lower, ["短く", "簡単に", "かんたんに"])) return "OK！短くまとめるね。\n\n要点だけにすると、いちばん大事なのは「目的を1つ決めて、小さく始めること」だよ。";
+  if (containsAny(lower, ["例を", "具体例", "たとえば"])) return "もちろん！たとえば、まず小さな例を1つ作って、うまくいったら少しずつ広げる方法が分かりやすいよ。テーマを教えてくれれば、具体例を3つ出せるよ。";
+  if (containsAny(lower, ["別の", "ほかの", "他の", "もう一つ", "もうひとつ"])) return "いいよ。さっきとは違う方向で考えるね。\n\n・シンプルに始める案\n・遊び心を入れる案\n・友達と一緒にできる案\n\nどの方向がよさそう？";
+  if (containsAny(lower, ["ありがとう", "ありがと", "助かった", "サンキュー"])) return "どういたしまして！😊 またいつでも続きから話してね。";
+  if (containsAny(lower, ["わからない", "分からない", "むずかしい", "難しい"])) return "大丈夫。いきなり全部分かろうとしなくてOKだよ。まず「どこまでは分かるか」を教えてくれたら、そこから一緒に進めよう。";
+  if (history.length >= 2 && containsAny(lower, ["それ", "これ", "じゃあ", "でも", "なら", "ってこと", "つまり"])) {
+    const prev = history.at(-2) || "前の話";
+    return `うん、前の話につなげると「${prev.slice(0, 45)}${prev.length > 45 ? "…" : ""}」の続きとして考えられるよ。\n\nその方向なら、まず一番やりたいことを1つ決めると進めやすいよ。`;
+  }
+  return null;
+}
+
+function smartJapanese(q, history) {
+  if (hasRecentAttachment(history) && !q) return "画像を受け取ったよ！🖼️\n\n今のNEXIO AIでは、添付した画像をこの画面に表示して会話に添えられるよ。画像について説明してほしいときは、画像と一緒に質問も送ってね。";
+  if (!q) return "何でも送ってね。😊";
+  const topic = extractTopic(q);
+  const recent = recentContext(history);
+
+  // If NEXIO AI just asked for a writing/essay topic, a short phrase such as
+  // 「夏休みの思い出」 is a creative topic, not a factual lookup target.
+  if (isWritingContext(history) && looksLikeWritingTopic(q)) {
+    return writingTopicReply(q);
+  }
+
+  const follow = followupJapanese(q, recent);
+  if (follow) return follow;
+
+  if (containsAny(q, ["やほ", "やっほ", "こんにちは", "こんばんは", "おはよう"])) {
+    return "やほー！😄 今日はどうしたの？\n\n雑談でも、質問でも、何か作る相談でも大丈夫だよ。";
+  }
+  if (containsAny(q, ["元気？", "元気", "調子どう"])) return "元気だよ！😄 NEXIO AIはいつでも話せるよ。今日は何について話そっか？";
+  if (containsAny(q, ["NEXIO AIですか", "NEXIO AI ですか", "NEXIO AIなの", "NEXIO AIなの？", "あなたはNEXIO AI", "ここはNEXIO AI"])) {
+    return "はい、NEXIO AIだよ！😊\n\nここで質問したり、雑談したり、アイデアを考えたり、勉強や文章づくりを手伝ったりできるよ。\n\n何か聞きたいことがあれば、そのまま送ってね！";
+  }
+  if (containsAny(q, ["あなたは誰", "何ができる", "できること", "何できる", "どんなこと"])) {
+    return "私はNEXIO AIだよ。😊\n\nできることは、たとえばこんな感じ！\n" + numbered([
+      "雑談やちょっとした相談",
+      "アイデア出し・企画づくり",
+      "勉強や宿題の整理",
+      "文章・作文・発表の下書き",
+      "英語の練習や翻訳",
+      "HTML・CSS・JavaScriptなどの相談",
+      "予定やToDoの整理"
+    ]) + "\n\n難しいことは、分からないときに無理に知ったふりをせず、できる範囲を伝えるよ。";
+  }
+  if (containsAny(q, ["時計", "今何時", "時間わかる", "時間分かる"])) {
+    const now = new Date();
+    const time = new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit" }).format(now);
+    return `うん、時間の話ならできるよ！🕐\n\n今の日本時間は **${time}** ごろだよ。\n\n「あと何分？」みたいな計算や、予定の時間整理もできるよ。`;
+  }
+  if (containsAny(q, ["アイデア", "案を", "企画", "思いつかない", "考えて"])) {
+    const countMatch = q.match(/(?:[0-9０-９]+)\s*(?:つ|個|案)/);
+    const requested = countMatch ? Math.max(1, Math.min(10, Number(countMatch[0].replace(/[^0-9０-９]/g, "").replace(/[０-９]/g, d => String.fromCharCode(d.charCodeAt(0) - 0xfee0))))) : 3;
+    const clean = topic.replace(/(?:アイデア|案|を|考えて|考える|出して|ください|ほしい|欲しい|教えて|面白い)/g, " ").replace(/\s+/g, " ").trim();
+
+    if (q.includes("文化祭") || q.includes("学園祭")) {
+      const ideas = [
+        "謎解き教室：教室全体を使って、参加者がヒントを探しながらゴールを目指す。最後に記念カードを渡すと盛り上がるよ。",
+        "巨大ガチャ＆くじ引き：文化祭限定の景品を用意して、チケットで挑戦できるゲーム。景品を見える場所に並べると参加しやすい。",
+        "クラス対抗ランキング：来場者の投票で「面白かった企画」「接客がよかった」などを決めて、最後に結果発表する。"
+      ];
+      return `いいね！文化祭なら、実際に準備しやすくて盛り上げやすい案を${requested}つ考えてみたよ。\n\n` + numbered(ideas.slice(0, requested)) + (requested > 3 ? "\n\n※4つ目以降も、予算や教室の広さに合わせて追加できるよ。" : "\n\n気になる案があれば、必要な材料・ルール・当日の流れまで一緒に作れるよ！");
+    }
+
+    const base = clean || "新しい企画";
+    const ideas = [
+      `体験型：参加した人が実際に遊んだり作ったりできる「${base}」にする。`,
+      `ゲーム型：投票・ミッション・ポイントなどを入れて、何度も参加したくなる「${base}」にする。`,
+      `SNS映え型：写真を撮りたくなる仕掛けを入れて、友達と共有しやすい「${base}」にする.`,
+      `協力型：2人以上で協力しないとクリアできない「${base}」にする。`,
+      `ランキング型：参加者の記録や投票を集計して、結果を発表する「${base}」にする。`
+    ];
+    return `いいね！「${base}」の具体的なアイデアを${requested}つ出すね。\n\n` + numbered(ideas.slice(0, requested)) + "\n\n気になる案があれば、そこから具体的な内容まで一緒に作れるよ！";
+  }
+  if (containsAny(q, ["勉強", "宿題", "学習", "テスト", "覚え方", "数学", "英語の勉強"])) {
+    return "もちろん！勉強は「一気に全部」より、小さく区切るとやりやすいよ。\n\n" + numbered([
+      "今日やる範囲を1つ決める",
+      "20〜25分だけ集中する",
+      "分からないところに印を付ける",
+      "答えを見る前にもう一度考える",
+      "最後に『今日分かったこと』を3つ書く"
+    ]) + "\n\n科目や問題を送ってくれたら、その内容に合わせて一緒に考えるよ。";
+  }
+  if (containsAny(q, ["英語", "english", "英文", "翻訳", "translate"])) {
+    return "英語もOK！😊\n\n・日本語→自然な英語\n・英作文のチェック\n・単語や文法の説明\n・英会話の練習\n\nたとえば「『今日は楽しかった』を英語で」みたいに、そのまま送ってね。";
+  }
+  // Math/topic-specific replies should run before generic conversation-context fallbacks.
+  if (containsAny(q, ["一次方程式", "1次方程式"])) {
+    return `一次方程式だね！😊
+
+一次方程式は、文字（たとえば x）が1つだけで、その文字の値を求める方程式だよ。
+
+たとえば、
+**2x + 3 = 11**
+なら、
+1. 両辺から3を引く → 2x = 8
+2. 両辺を2で割る → **x = 4**
+
+ポイントは、xを1人にするように、両辺へ同じ計算をすること。
+
+問題を送ってくれたら、答えだけでなく途中式も順番に説明するよ！`;
+  }
+  if (containsAny(q, ["二次方程式", "2次方程式"])) {
+    return `二次方程式だね！📘
+
+二次方程式は、x²を含む方程式のことだよ。
+
+たとえば **x² - 5x + 6 = 0** なら、
+**(x - 2)(x - 3) = 0** と因数分解できるので、
+**x = 2 または x = 3** になるよ。
+
+問題を送ってくれれば、因数分解・解の公式・平方完成など、使う方法も含めて説明するよ！`;
+  }
+  if (containsAny(q, ["方程式", "連立方程式", "比例", "反比例", "関数", "因数分解", "平方根", "確率"])) {
+    return `「${topic}」についてだね！📚
+
+まずは、意味を簡単に説明してから、具体例→練習問題の順で一緒に進められるよ。
+
+${topic}について知りたいのが「意味」「解き方」「問題を解く」のどれか教えてくれてもいいし、問題をそのまま送ってくれてもOK！`;
+  }
+  if (containsAny(q, ["プログラミング", "コード", "javascript", "html", "css", "python", "プログラム"])) {
+    return "プログラミング相談だね！💻\n\n「何を作りたいか」と「今どこで困っているか」を送ってくれれば、順番に整理するよ。\n\nコードを貼ってくれた場合は、どこを直せばいいかも一緒に見られるよ。";
+  }
+  if (containsAny(q, ["予定", "スケジュール", "todo", "やること", "計画"])) {
+    return "予定整理もできるよ。\n\nやることをそのまま箇条書きで送ってくれれば、\n① 今すぐやる\n② 今日やる\n③ あとでやる\nのように整理するよ。";
+  }
+  if (containsAny(q, ["眠い", "疲れた", "しんどい"])) {
+    return "おつかれさま。😌 無理に頑張り続けなくても大丈夫だよ。\n\nちょっと休んでから続けるのもあり。話したいだけなら、それでも大丈夫だよ。";
+  }
+  if (isCasual(q)) return "いいね！😄 その話、もう少し聞きたい！\n\n続きでも、全然別の話でもOK。今いちばん話したいことを送ってみて。";
+  if (isQuestion(q)) {
+    return `「${topic}」についてだね。\n\n質問の答えをできるだけ分かりやすく整理するよ。もし「初心者向け」「短く」「具体例つき」など希望があれば、その形に合わせられるよ。\n\n知りたいポイントをもう一言だけ足してくれてもOK！`;
+  }
+  if (containsAny(q, ["作文を作って", "作文を書いて", "文章を作って", "文章を書いて"])) {
+    return `もちろん！😊\n\n作文を作るよ。まずテーマを教えてね。\n\nたとえば「夏休みの思い出」「将来の夢」「好きなもの」など、テーマをそのまま送ってくれれば、タイトル・書き出し・本文・まとめまで自然な作文にできるよ。`;
+  }
+  if (isExplicitNewTask(q)) {
+    return `「${topic}」についての新しい依頼として受け取ったよ。😊\n\n前の話とは分けて、この依頼だけに答えるね。必要なら、目的や条件を一言追加してくれれば、もっと具体的にできるよ。`;
+  }
+  if (recent.length >= 2) {
+    const prev = recent.at(-2);
+    return `なるほど、「${q}」なんだね。😊\n\nさっきの「${prev.slice(0, 35)}${prev.length > 35 ? "…" : ""}」の流れも考えると、もう少し具体的にしていけそう。\n\n「どうしたらいい？」「例を出して」「一緒に作って」みたいに続けてくれれば、その方向で進めるよ。`;
+  }
+  return `なるほど！「${q}」なんだね。😊\n\nもう少し詳しく聞けたら、一緒に考えられるよ。\n\nたとえば「理由を知りたい」「例がほしい」「一緒に作りたい」みたいに続けてみて！`;
+}
+
+function smartEnglish(q, history) {
+  const lower = q.toLowerCase();
+  if (hasRecentAttachment(history) && !q) return "I received your image! 🖼️\n\nThe current no-API version can attach and display images in the chat, but it does not analyze the image content yet. Send a question with the image if you want to describe what you need.";
+  if (!q) return "Send me anything. 😊";
+  if (containsAny(lower, ["hello", "hi", "hey"])) return "Hey! 😄 How's it going? We can chat, brainstorm, study, write, code, or just talk.";
+  if (containsAny(lower, ["how are you", "you good"])) return "I'm good! 😄 What do you want to talk about?";
+  if (containsAny(lower, ["what can you do", "who are you"])) return "I'm NEXIO AI. I can help with ideas, studying, writing, English practice, coding, planning, and casual conversation.";
+  if (containsAny(lower, ["clock", "what time", "time now"])) {
+    const now = new Date();
+    const time = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit" }).format(now);
+    return `Sure! 🕐 The current time in Japan is around ${time}.`;
+  }
+  if (containsAny(lower, ["idea", "ideas", "brainstorm"])) return "Let's brainstorm! 😄\n\n1. Start with a simple version.\n2. Add an interactive element.\n3. Make a version friends can build together.\n4. Turn it into a small website or project.\n5. Test it and improve it.\n\nTell me the topic and I'll make the ideas more specific.";
+  if (containsAny(lower, ["study", "homework", "test", "learn"])) return "Sure! A simple study routine is:\n1. Pick one small goal.\n2. Focus for 20–25 minutes.\n3. Mark what you don't understand.\n4. Try again before checking the answer.\n5. Write down three things you learned.\n\nTell me the subject and I can tailor it.";
+  if (containsAny(lower, ["write", "essay", "speech", "paragraph", "translate"])) return "I can help with that. Send me the text or topic, and tell me whether you want it shorter, clearer, more natural, or more formal.";
+  if (containsAny(lower, ["code", "coding", "javascript", "html", "css", "python"])) return "Sure! Tell me what you want to build and what is going wrong. You can paste the code too, and we can work through it step by step.";
+  if (containsAny(lower, ["more", "explain", "example", "another"])) return "Absolutely. Tell me which part you want expanded, and I can explain it with a simple example.";
+  if (/[?]$/.test(q) || containsAny(lower, ["why", "what is", "how do"])) return `Good question: “${q}”. I can explain it simply, give an example, or go deeper. Which style do you want?`;
+  return `Got it — “${q}”. 😊\n\nTell me what you want to do with it, and I'll help you take the next step.`;
+}
+
+
+
+// Lightweight server-side knowledge engine: no WebGPU, no API key, no local model.
+// It uses Wikipedia's public API for factual topics, then formats the result for the user's requested style.
+function stripWikiMarkup(text = "") {
+  return String(text)
+    .replace(/<[^>]*>/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractFactualTopic(q = "") {
+  let topic = textOf(q)
+    .replace(/^(?:ねえ|ねぇ|ちょっと|えーと|えっと|あの|もしもし)[、,。\s]*/i, "")
+    .replace(/[？?！!]$/g, "")
+    .trim();
+
+  // Prefer the actual subject before 「について」. This prevents a full
+  // instruction such as 「富士山について、小学生にも分かるように説明して」
+  // from being sent to Wikipedia as one long search query (which could return
+  // an unrelated page such as 静岡県).
+  const about = topic.match(/^(.+?)\s*について(?:[、,。\s]|$)/);
+  if (about?.[1]) topic = about[1].trim();
+
+  // Remove common request wording when 「について」 was not used.
+  topic = topic
+    .replace(/^(?:教えて|説明して|解説して|知りたい)\s*/i, "")
+    .replace(/(?:教えて|説明して|解説して|知りたい|とは何|って何|ってなに|とは|何ですか|何でしょう|何？|何\?)$/i, "")
+    .trim();
+
+  // Strip audience/style clauses that are not part of the factual subject.
+  topic = topic
+    .replace(/[、,]\s*(?:小学生|子ども|子供|初心者)[^、,。]*?(?:ように|向け|向けに|にも)?$/i, "")
+    .trim();
+
+  if (!topic || topic.length > 80) return "";
+  return topic;
+}
+
+function wantsSimple(q = "") {
+  return containsAny(q, ["小学生", "子ども", "子供", "簡単", "かんたん", "わかりやす", "分かりやす", "初心者"]);
+}
+
+function formatWikiAnswer(topic, summary, language, simple) {
+  const clean = stripWikiMarkup(summary).replace(/\s+/g, " ").trim();
+  if (!clean) return null;
+  if (language === "en") {
+    const lead = simple ? `Here is a simple explanation of ${topic}:` : `Here is a quick explanation of ${topic}:`;
+    return `${lead}\n\n${clean.slice(0, 900)}\n\nIf you want, I can also explain it with examples or in more detail.`;
+  }
+  const lead = simple ? `「${topic}」を、できるだけ分かりやすく説明するね。` : `「${topic}」について説明するね。`;
+  let body = clean.slice(0, simple ? 650 : 900);
+  if (simple) {
+    body = body
+      .replace(/。/g, "。\n")
+      .replace(/\n{2,}/g, "\n")
+      .trim();
+  }
+  return `${lead}\n\n${body}\n\nもっと詳しく知りたいところがあれば、そこを中心に説明できるよ。`;
+}
+
+async function fetchWikiSummary(topic, language = "ja") {
+  const lang = language === "en" ? "en" : "ja";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const searchUrl = `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(topic)}&utf8=1&format=json&origin=*`;
+    const searchRes = await fetch(searchUrl, { signal: controller.signal, headers: { "User-Agent": "NEXIO-AI/4.5 (educational chatbot)" } });
+    if (!searchRes.ok) return null;
+    const searchData = await searchRes.json();
+    const title = searchData?.query?.search?.[0]?.title;
+    if (!title) return null;
+    const summaryUrl = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
+    const summaryRes = await fetch(summaryUrl, { signal: controller.signal, headers: { "User-Agent": "NEXIO-AI/4.5 (educational chatbot)" } });
+    if (!summaryRes.ok) return null;
+    const data = await summaryRes.json();
+    return { title: data.title || title, extract: data.extract || "", url: data.content_urls?.desktop?.page || "" };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function looksLikeShortTopic(q) {
+  const t = textOf(q).trim();
+  if (!t || t.length > 24) return false;
+  if (/[?？]$/.test(t)) return false;
+  if (containsAny(t, [
+    "ありがとう", "ありがと", "どういたしまして", "こんにちは", "こんばんは", "おはよう",
+    "やほ", "やっほ", "元気", "暇", "話そ", "話そう", "それ", "これ", "じゃあ",
+    "でも", "なら", "つまり", "もっと", "詳しく", "くわしく", "短く", "簡単に",
+    "例を", "具体例", "別の", "ほかの", "他の", "もう一つ", "もうひとつ"
+  ])) return false;
+  return /^[^、。！？!?]{1,24}$/.test(t);
+}
+
+async function knowledgeReply(messages, language) {
+  const q = lastUser(messages);
+  if (!q) return null;
+  if (isWritingContext(messages) && looksLikeWritingTopic(q)) return null;
+  if (containsAny(q, ["今何時", "今の時間", "今日の日付", "今日は何日"])) return null;
+  // A short noun/topic such as 「お金」「火星」「Python」 is often a new
+  // topic, even when it follows another conversation. Treat it as a factual
+  // lookup instead of replying with a generic continuation message.
+  if (!isQuestion(q) && !looksLikeShortTopic(q)) return null;
+  const topic = extractFactualTopic(q);
+  if (!topic) return null;
+  // Avoid sending clearly conversational/creative prompts to Wikipedia.
+  if (containsAny(topic, ["考えて", "作って", "書いて", "作成", "相談", "どうしたら", "おすすめ", "アイデア"])) return null;
+  const result = await fetchWikiSummary(topic, language);
+  if (!result?.extract) return null;
+  const answer = formatWikiAnswer(result.title || topic, result.extract, language, wantsSimple(q));
+  if (!answer) return null;
+  return { text: answer, source: result.url || null, title: result.title || topic };
+}
+
+
+
+
+
+function isAlifoMediaRequest(q = "") {
+  const t = textOf(q).toLowerCase();
+  return /alifo\s*media|alifomedia|alifo-media|alifoメディア|alifoニュース|alifomediaニュース/.test(t);
+}
+
+function stripHtmlForNews(html = "") {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractFeedItems(xml = "") {
+  const items = [];
+  const blocks = String(xml).match(/<(item|entry)\b[\s\S]*?<\/(item|entry)>/gi) || [];
+  for (const block of blocks.slice(0, 10)) {
+    const title = (block.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "").replace(/<[^>]+>/g, "").trim();
+    const linkMatch = block.match(/<link[^>]+href=["']([^"']+)["'][^>]*>/i);
+    const link = linkMatch?.[1] || block.match(/<link[^>]*>([\s\S]*?)<\/link>/i)?.[1]?.trim() || "";
+    const date = (block.match(/<(pubDate|published|updated)[^>]*>([\s\S]*?)<\/\1>/i)?.[2] || "").replace(/<[^>]+>/g, "").trim();
+    const description = (block.match(/<(description|summary|content:encoded)[^>]*>([\s\S]*?)<\/(description|summary|content:encoded)>/i)?.[2] || "");
+    const cleanDescription = stripHtmlForNews(description).slice(0, 300);
+    if (title) items.push({ title, link, date, description: cleanDescription });
+  }
+  return items;
+}
+
+async function fetchAlifoMediaNews() {
+  // Keep the news lookup fast: all candidate endpoints are tried in parallel
+  // and the first usable result wins. The old sequential approach could spend
+  // tens of seconds trying unavailable feeds on Render's free instance.
+  const candidates = [
+    {
+      url: "https://alifo-media.com/wp-json/wp/v2/posts?per_page=8&_fields=link,date,modified,title,excerpt",
+      kind: "json"
+    },
+    {
+      url: "https://alifo-media.com/feed",
+      kind: "xml"
+    },
+    {
+      url: "https://alifo-media.com/feed/",
+      kind: "xml"
+    },
+    {
+      url: "https://alifo-media.com/rss",
+      kind: "xml"
+    },
+    {
+      url: "https://alifo-media.com/rss.xml",
+      kind: "xml"
+    },
+    {
+      url: "https://alifo-media.com/",
+      kind: "html"
+    }
+  ];
+
+  const readCandidate = async ({ url, kind }) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4500);
+    try {
+      const res = await fetch(url, {
+        signal: controller.signal,
+        redirect: "follow",
+        headers: {
+          "Accept": kind === "json" ? "application/json" : "text/html,application/xml,text/xml;q=0.9,*/*;q=0.8",
+          "User-Agent": "NEXIO-AI/1.0 (ALIFOmedia news reader)"
+        }
+      });
+      if (!res.ok) return null;
+
+      const type = res.headers.get("content-type") || "";
+      const body = await res.text();
+
+      if (kind === "json" || /application\/json/i.test(type)) {
+        try {
+          const data = JSON.parse(body);
+          if (!Array.isArray(data) || !data.length) return null;
+          const items = data.map(item => ({
+            title: stripHtmlForNews(item?.title?.rendered || item?.title || "").slice(0, 180),
+            link: typeof item?.link === "string" ? item.link : "",
+            date: item?.date || item?.modified || "",
+            description: stripHtmlForNews(item?.excerpt?.rendered || item?.excerpt || "").slice(0, 300)
+          })).filter(item => item.title);
+          return items.length ? { source: url, items: items.slice(0, 8) } : null;
+        } catch {
+          return null;
+        }
+      }
+
+      if (/xml|rss|atom/i.test(type) || /^\s*<\?xml|<rss\b|<feed\b/i.test(body)) {
+        const items = extractFeedItems(body);
+        if (items.length) return { source: url, items: items.slice(0, 8) };
+      }
+
+      if (kind === "html" && /<html/i.test(body)) {
+        const items = [];
+        const seen = new Set();
+        const articleBlocks = body.match(/<article\b[\s\S]*?<\/article>/gi) || [];
+
+        for (const block of articleBlocks.slice(0, 12)) {
+          const href = block.match(/<a\b[^>]*href=["']([^"']+)["'][^>]*>/i)?.[1] || "";
+          const heading = block.match(/<(h1|h2|h3|h4)\b[^>]*>([\s\S]*?)<\/\1>/i)?.[2] || "";
+          const time = block.match(/<time\b[^>]*(?:datetime=["']([^"']+)["'])?[^>]*>([\s\S]*?)<\/time>/i);
+          const title = stripHtmlForNews(heading).replace(/\s+/g, " ").trim();
+          if (!href || title.length < 4 || title.length > 180) continue;
+          try {
+            const link = new URL(href, url).href;
+            if (!link.startsWith("https://alifo-media.com/") || seen.has(link)) continue;
+            seen.add(link);
+            items.push({
+              title,
+              link,
+              date: time?.[1] || stripHtmlForNews(time?.[2] || ""),
+              description: stripHtmlForNews(block).slice(0, 300)
+            });
+          } catch {}
+        }
+
+        if (!items.length) {
+          const re = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+          let m;
+          while ((m = re.exec(body)) && items.length < 12) {
+            const title = stripHtmlForNews(m[2]).replace(/\s+/g, " ").trim();
+            if (title.length < 8 || title.length > 180) continue;
+            try {
+              const link = new URL(m[1], url).href;
+              if (!link.startsWith("https://alifo-media.com/") || seen.has(link)) continue;
+              seen.add(link);
+              items.push({ title, link, date: "", description: "" });
+            } catch {}
+          }
+        }
+
+        return items.length ? { source: url, items: items.slice(0, 8) } : null;
+      }
+
+      return null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const results = await Promise.all(candidates.map(readCandidate));
+  return results.find(Boolean) || null;
+}
+
+function smartReply(messages, language) {
+  const q = lastUser(messages);
+  // Never fabricate an answer to a factual/current question when the external
+  // and on-device models have failed. This is safer than returning an
+  // unrelated canned answer.
+  if (isQuestionLike(q) || containsAny(q, ["最新", "今日", "現在", "ニュース", "政治", "選挙", "放送", "発売", "価格", "誰", "どこ", "いつ"])) {
+    return language === "en"
+      ? "I couldn't verify that information right now. I don't want to guess and give you an incorrect answer."
+      : "今はその情報を確認できませんでした。間違った情報を推測で答えないように、ここでは断定しません。";
+  }
+  return language === "en" ? smartEnglish(q, messages) : smartJapanese(q, messages);
+}
+
+
+app.post("/api/external-ai", async (req, res) => {
+  if (!rateLimit(clientKey(req, "external-ai"), 30, 60_000)) {
+    return res.status(429).json({ error: "しばらく待ってからもう一度お試しください。" });
+  }
+  try {
+    const { messages = [] } = req.body || {};
+    if (!externalApiConfigured()) return res.status(503).json({ error: "Direct external AI is not configured" });
+    const result = await directExternalReply(messages);
+    return res.json(result);
+  } catch (err) {
+    return res.status(502).json({ error: err?.message || "Direct external AI failed" });
+  }
+});
+
+
+app.get("/api/alifomedia-news", async (req, res) => {
+  if (!rateLimit(clientKey(req, "alifomedia-news"), 30, 60_000)) {
+    return res.status(429).json({ error: "しばらく待ってからもう一度お試しください。" });
+  }
+  try {
+    const result = await fetchAlifoMediaNews();
+    if (!result) return res.status(502).json({ error: "ALIFOmediaニュースを取得できませんでした。" });
+    return res.json({ site: "ALIFOmedia", ...result });
+  } catch {
+    return res.status(502).json({ error: "ALIFOmediaニュースの取得に失敗しました。" });
+  }
+});
+
+app.post("/api/chat", async (req, res) => {
+  if (!rateLimit(clientKey(req, "chat"), 60, 60_000)) {
+    return res.status(429).json({ error: "しばらく待ってからもう一度お試しください。" });
+  }
+  try {
+    const { messages = [], language = "ja" } = req.body || {};
+    const safeMessages = Array.isArray(messages) ? messages.slice(-30) : [];
+    const lang = language === "en" ? "en" : "ja";
+    const knowledge = await knowledgeReply(safeMessages, lang);
+    if (knowledge) return res.json({ text: knowledge.text, source: knowledge.source, sourceTitle: knowledge.title, mode: "knowledge" });
+    res.json({ text: smartReply(safeMessages, lang), mode: "stable-fallback" });
+  } catch {
+    res.status(400).json({ error: "メッセージを処理できませんでした。" });
+  }
+});
+
+app.post("/api/image", (req, res) => {
+  if (!rateLimit(clientKey(req, "image"), 10, 60_000)) {
+    return res.status(429).json({ error: "画像生成の回数が多いため、少し待ってからお試しください。" });
+  }
+  try {
+    const { prompt = "", size = "1024x1024" } = req.body || {};
+    const cleanPrompt = String(prompt).trim().slice(0, 1000);
+    if (!cleanPrompt) return res.status(400).json({ error: "画像の説明を入力してください。" });
+    const [width, height] = String(size).split("x").map(Number);
+    const safeWidth = Number.isFinite(width) && width >= 256 && width <= 1536 ? width : 1024;
+    const safeHeight = Number.isFinite(height) && height >= 256 && height <= 1536 ? height : 1024;
+    const seed = Math.floor(Math.random() * 2147483647);
+    const params = new URLSearchParams({ model: "flux", width: String(safeWidth), height: String(safeHeight), nologo: "true", private: "true", safe: "true", seed: String(seed) });
+    const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(cleanPrompt)}?${params.toString()}`;
+    res.json({ image: imageUrl, provider: "Pollinations" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "画像生成の準備中にエラーが発生しました。" });
+  }
+});
+
+app.get("/api/image-download", async (req, res) => {
+  try {
+    const raw = String(req.query.url || "");
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.hostname !== "image.pollinations.ai") return res.status(400).send("Invalid image URL");
+    const upstream = await fetch(url, { redirect: "follow" });
+    if (!upstream.ok) return res.status(502).send("Image service unavailable");
+    const contentType = upstream.headers.get("content-type") || "";
+    if (!contentType.startsWith("image/")) return res.status(502).send("Not an image");
+    const length = Number(upstream.headers.get("content-length") || 0);
+    if (length > 15 * 1024 * 1024) return res.status(413).send("Image too large");
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    if (buffer.length > 15 * 1024 * 1024) return res.status(413).send("Image too large");
+    const ext = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="nexio-ai-image.${ext}"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.send(buffer);
+  } catch { res.status(400).send("Unable to download image"); }
+});
+
+app.get("/{*splat}", (_, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
+app.listen(PORT, () => console.log(`NEXIO AI v5.1 running on http://localhost:${PORT}`));
